@@ -1,14 +1,13 @@
 package service
 
 import (
-	"errors"
-	"fmt"
+	"gbserver/models"
+	"hash/fnv"
 	"math/rand"
 	"regexp"
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 )
 
 type OwnerInfo struct {
@@ -46,7 +45,7 @@ type ListBranchresponse struct {
 	// 	"Name": "master",
 	// 	"Commit": {
 	// 	  "SHA": "c5b97d5ae6c19d5c5df71a34c7fbeeda2479ccbc",
-	// 	  "URL": "https://api.github.com/Repos/admin/Hello-World/commits/c5b97d5ae6c19d5c5df71a34c7fbeeda2479ccbc"
+	// 	  "URL": "https://api.gbserver.com/Repos/admin/Hello-World/commits/c5b97d5ae6c19d5c5df71a34c7fbeeda2479ccbc"
 	// 	},
 	// 	"Protected": true,
 }
@@ -68,26 +67,25 @@ type CreateBranchResponse struct {
 	NodeID string
 	URL    string
 	Object CreateBranchObjectResponse
-	//	{Ref: "refs/heads/gbbranch", NodeID: "MDM6UmVmcmVmcy9oZWFkcy9mZWF0dXJlQQ==", URL: "https://api.github.com/Repos/gbUser/gbRepo/git/refs/heads/gbbranch",
+	//	{Ref: "refs/heads/gbbranch", NodeID: "MDM6UmVmcmVmcy9oZWFkcy9mZWF0dXJlQQ==", URL: "https://api.gbserver.com/Repos/gbUser/gbRepo/git/refs/heads/gbbranch",
 	//
 	//	"Object": {
 	//			  "type": "Commit",
 	//			  "SHA": "aa218f56b14c9653891f9e74264a383fa43fefbd",
-	//			  "URL": "https://api.github.com/Repos/octocat/Hello-World/git/commits/aa218f56b14c9653891f9e74264a383fa43fefbd"
+	//			  "URL": "https://api.gbserver.com/Repos/octocat/Hello-World/git/commits/aa218f56b14c9653891f9e74264a383fa43fefbd"
 	//			},
 }
 
 type baseHeadPRResponse struct {
-	Label string
-	Ref   string
-	SHA   string
-	User  OwnerInfo
-	Repo  RepoResponse
+	Ref  string
+	SHA  string
+	User OwnerInfo
+	Repo string
 }
 
 type PRResponse struct {
 	URL          string
-	ID           int
+	ID           string
 	NodeID       string
 	Title        string
 	Body         string
@@ -125,49 +123,51 @@ type Gbservice interface {
 	DeleteBranch(owner, repoName, Ref string) (bool, error)                                        //delete /Repos/{owner}/{Repo}/git/refs/{Ref}
 
 	// Pull request
-	ListPRs(owner, repoName string) ([]PRResponse, error)                                      // get /Repos/{owner}/{Repo}/pulls
-	CreatePR(owner, repoName string, cPRReq *PRRequest) (PRResponse, error)                    // post /Repos/{owner}/{Repo}/pulls
-	ClosePR(owner, repoName string, pull_number int, prRequest *PRRequest) (PRResponse, error) //patch /Repos/{owner}/{Repo}/pulls/{pull_number} State - closed
+	ListPRs(owner, repoName string) ([]PRResponse, error)                                       // get /Repos/{owner}/{Repo}/pulls
+	CreatePR(owner, repoName string, cPRReq *PRRequest) (PRResponse, error)                     // post /Repos/{owner}/{Repo}/pulls
+	UpdatePR(owner, repoName string, pull_number int, prRequest *PRRequest) (PRResponse, error) //patch /Repos/{owner}/{Repo}/pulls/{pull_number} State - closed
 
 }
 
-type Gbserver struct {
-	muRW sync.RWMutex
+type GbService struct {
+	GbStoreInstance *models.GbStore
 }
 
-func (g *Gbserver) ListRepos(orgName string) []RepoResponse {
-	owners := getOrgMembers(orgName)
-	var Repos []RepoResponse
-	for _, repoData := range gbServerRepoData {
-		for _, owner := range owners {
-			if owner.Login == repoData.OwnerInfo.Login { // == owner && data.OwnerInfo.ID == ID {
-				//fmt.Println(repoData)
-				Repos = append(Repos, repoData)
-			}
-		}
+func hasher(data string) string {
+	h := fnv.New64a()
+	h.Write([]byte(data))
+	return strconv.FormatUint(h.Sum64(), 10)
+}
+func (g *GbService) ListRepos(orgName, ownerName string) ([]RepoResponse, error) {
+	var outputResp []RepoResponse
+	if _, exists := g.GbStoreInstance.Orgs[orgName]; !exists {
+		return outputResp, ErrOrgNotFound
 	}
-	return Repos
-}
-
-func validateOrg(orgName string) bool {
-	for org := range gbServerOrg {
-		if orgName == org {
-			return true
-		}
+	if _, exists := g.GbStoreInstance.Users[orgName+"/"+ownerName]; !exists {
+		return outputResp, ErrOwnerNotFound
 	}
-	return false
-}
 
-func generateID() int {
-	low := 10000
-	hi := 99999
-	return low + rand.Intn(hi-low)
+	g.GbStoreInstance.MU.RLock()
+	repoList := g.GbStoreInstance.Users[orgName+"/"+ownerName].Repos
+	repoOwner := g.GbStoreInstance.Users[orgName+"/"+ownerName]
+
+	g.GbStoreInstance.MU.RUnlock()
+	ownerInfo := OwnerInfo{Login: repoOwner.LoginName, ID: repoOwner.ID, NodeID: repoOwner.NodeID, UserType: repoOwner.UserType}
+
+	for _, repoInfo := range repoList {
+		g.GbStoreInstance.MU.RLock()
+		repoDetails := g.GbStoreInstance.Repos[orgName+"/"+ownerName+"/"+repoInfo]
+		g.GbStoreInstance.MU.RUnlock()
+		repoResponse := RepoResponse{ID: repoDetails.ID, Name: repoDetails.Name, Node_ID: repoDetails.Node_ID, Description: repoDetails.Description, OwnerInfo: ownerInfo}
+		outputResp = append(outputResp, repoResponse)
+	}
+	return outputResp, nil
 }
 
 func generateCustomID(IDType string) string {
 	var randomChar string
 	var IDLen int
-	if IDType == "NodeID" {
+	if IDType == "NODEID" {
 		randomChar = "aAbBcC1d2e3D4fe5gE6hF7ij8Gk9HlI0JmKnX=o=LWYMNpZqOrPsVQtuvRwSxTyUz"
 		IDLen = 23
 	}
@@ -183,381 +183,445 @@ func generateCustomID(IDType string) string {
 	return NodeID
 }
 
-func getOrgMembers(orgName string) []OwnerInfo {
-	for org, members := range gbServerOrg {
-		if orgName == org {
-			return members
-		}
-	}
-	return nil
-}
+func (g *GbService) CreateRepo(orgName, ownerName string, RepoRequest *CreateRepoRequest) (RepoResponse, error) {
 
-func getIDFromOwner(owner string) (int, error) {
-
-	for _, ownerDetails := range gbServerOwners {
-		if ownerDetails.Login == owner {
-			return ownerDetails.ID, nil
-		}
-	}
-	return 0, ErrOwnerNotFound
-}
-
-func (g *Gbserver) CreateRepo(orgName string, RepoRequest *CreateRepoRequest) (RepoResponse, error) {
-
-	if !validateOrg(orgName) {
+	g.GbStoreInstance.MU.RLock()
+	if _, exists := g.GbStoreInstance.Orgs[orgName]; !exists {
+		g.GbStoreInstance.MU.RUnlock()
 		return RepoResponse{}, ErrOrgNotFound
 	}
-	var err error
-	repoList := g.ListRepos(orgName)
-	for _, repo := range repoList {
-		if repo.Name == RepoRequest.Name {
-			err = errors.New("repo already exist")
-			return RepoResponse{}, err
-		}
+	if _, exists := g.GbStoreInstance.Users[orgName+"/"+ownerName]; !exists {
+		g.GbStoreInstance.MU.RUnlock()
+		return RepoResponse{}, ErrOwnerNotFound
 	}
-	//owner, ID := getUserNameAndID(orgName)
-	var owner = gbServerOrg[orgName][0].Login
-	var ID = gbServerOrg[orgName][0].ID
-	resp := RepoResponse{ID: generateID(),
-		Name:        RepoRequest.Name,
-		Node_ID:     generateCustomID("NodeID"),
+
+	repoList := g.GbStoreInstance.Users[orgName+"/"+ownerName].Repos
+	if slices.Contains(repoList, RepoRequest.Name) {
+		g.GbStoreInstance.MU.RUnlock()
+		return RepoResponse{}, ErrRepoAlreadyExists
+	}
+
+	repoID := g.GbStoreInstance.Orgs[orgName].ReposCount + 1
+
+	g.GbStoreInstance.MU.RUnlock()
+	nodeID := generateCustomID("NODEID")
+	g.GbStoreInstance.MU.Lock()
+
+	g.GbStoreInstance.Repos[orgName+"/"+ownerName+"/"+RepoRequest.Name] = &models.Repository{ID: repoID, Name: RepoRequest.Name, Node_ID: nodeID,
 		Description: RepoRequest.Description,
-		OwnerInfo:   OwnerInfo{Login: owner, ID: ID, NodeID: "MDQ6VXNlcjE=", UserType: "User"}}
-	g.muRW.Lock()
-	gbServerRepoData = append(gbServerRepoData, resp)
-	g.muRW.Unlock()
-	return resp, err
+		OrgName:     orgName, UserName: ownerName, Branches: []string{}}
+
+	g.GbStoreInstance.Users[orgName+"/"+ownerName].Repos = append(g.GbStoreInstance.Users[orgName+"/"+ownerName].Repos, RepoRequest.Name)
+	g.GbStoreInstance.Orgs[orgName].Repos = append(g.GbStoreInstance.Orgs[orgName].Repos, RepoRequest.Name)
+	g.GbStoreInstance.Orgs[orgName].ReposCount = repoID
+	g.GbStoreInstance.MU.Unlock()
+	g.GbStoreInstance.MU.RLock()
+
+	resp := RepoResponse{ID: repoID, Name: RepoRequest.Name, Node_ID: nodeID, Description: RepoRequest.Description,
+		OwnerInfo: OwnerInfo{Login: g.GbStoreInstance.Users[orgName+"/"+ownerName].LoginName,
+			ID:       g.GbStoreInstance.Users[orgName+"/"+ownerName].ID,
+			NodeID:   g.GbStoreInstance.Users[orgName+"/"+ownerName].NodeID,
+			UserType: g.GbStoreInstance.Users[orgName+"/"+ownerName].UserType,
+		}}
+	g.GbStoreInstance.MU.RUnlock()
+
+	return resp, nil
 }
 
-func (g *Gbserver) DeleteRepo(owner, repoName string) (bool, error) {
+func removeElementByValue(slice []string, value string) []string {
+	for i, v := range slice {
+		if v == value {
+			slice = slices.Delete(slice, i, i+1)
+		}
+	}
+	return slice
 
-	ID, err := getIDFromOwner(owner)
+}
+func (g *GbService) DeleteRepo(orgName, owner, repoName string) (bool, error) {
+
+	err := g.validateOrgOwnerRepo(orgName, owner, repoName)
 	if err != nil {
-		fmt.Println("Error occurred.", err)
 		return false, err
 	}
-	resp := make([]RepoResponse, len(gbServerRepoData))
-	copy(resp, gbServerRepoData)
-	for index, data := range resp {
-		if data.OwnerInfo.Login == owner && data.OwnerInfo.ID == ID && data.Name == repoName {
-			gbServerRepoData = append(gbServerRepoData[:index], gbServerRepoData[index+1:]...)
-			fmt.Println(gbServerRepoData)
-			return true, nil
-		}
-	}
-	return false, ErrRepoNotFound
+	g.GbStoreInstance.MU.Lock()
+	delete(g.GbStoreInstance.Repos, orgName+"/"+owner+"/"+repoName)
+	g.GbStoreInstance.Users[orgName+"/"+owner].Repos = removeElementByValue(g.GbStoreInstance.Users[orgName+"/"+owner].Repos, repoName)
+	g.GbStoreInstance.Orgs[orgName].Repos = removeElementByValue(g.GbStoreInstance.Orgs[orgName].Repos, repoName)
+	g.GbStoreInstance.MU.Unlock()
+
+	return true, nil
 }
 
-func (g *Gbserver) validateOwnerAndRepo(owner, repoName string) error {
-	_, err := getIDFromOwner(owner)
+func (g *GbService) ListBranches(orgName, owner, repoName string) ([]ListBranchresponse, error) {
+
+	var outputResp []ListBranchresponse
+	err := g.validateOrgOwnerRepo(orgName, owner, repoName)
 	if err != nil {
-		return ErrOwnerNotFound
+		return outputResp, err
 	}
-	repoList := g.ListRepos(orgName)
-	var repoFound bool
-	for _, repo := range repoList {
-		if repo.Name == repoName {
-			repoFound = true
-		}
+	g.GbStoreInstance.MU.RLock()
+	branchList := g.GbStoreInstance.Repos[orgName+"/"+owner+"/"+repoName].Branches
+	g.GbStoreInstance.MU.RUnlock()
+	if len(branchList) == 0 {
+		return outputResp, ErrBranchesNotFound
 	}
-	if !repoFound {
-		return ErrRepoNotFound
+	for _, branchName := range branchList {
+		g.GbStoreInstance.MU.RLock()
+
+		branchData := g.GbStoreInstance.Branches[orgName+"/"+owner+"/"+repoName+"/"+branchName]
+		g.GbStoreInstance.MU.RUnlock()
+		commitDetails := CommitDetails{SHA: branchData.CommitInfo.SHA, URL: branchData.CommitInfo.URL}
+
+		branchresponse := ListBranchresponse{Name: branchName, Commit: commitDetails, Protected: branchData.Protected}
+		outputResp = append(outputResp, branchresponse)
 	}
-	return nil
+
+	return outputResp, nil
 }
 
-func (g *Gbserver) ListBranches(owner, repoName string) ([]ListBranchresponse, error) {
-	var found bool
-	var output []ListBranchresponse
+func (g *GbService) CreateBranch(orgName, owner, repoName string, cbreq *CreateBranchRequest) (CreateBranchResponse, error) {
 
-	for _, data := range gbSeverBranchListData {
-		input := data.Commit.URL
-		re := regexp.MustCompile(`repos/([^/]+)/([^/]+)/commits`)
-		matches := re.FindStringSubmatch(input)
+	var createBranchResp CreateBranchResponse
 
-		if len(matches) >= 3 {
-			User := matches[1]
-			Repo := matches[2]
-			//	fmt.Println("Organization & Repo name..", User, Repo)
-
-			err := g.validateOwnerAndRepo(owner, repoName)
-			if err != nil {
-				return output, err
-			}
-
-			if User == owner && Repo == repoName {
-				output = append(output, data)
-				found = true
-			}
-		}
-	}
-	if found {
-		return output, nil
-	}
-	return output, ErrBranchesNotFound
-}
-
-func (g *Gbserver) CreateBranch(owner, repoName string, cbreq *CreateBranchRequest) (CreateBranchResponse, error) {
-	err := g.validateOwnerAndRepo(owner, repoName)
+	err := g.validateOrgOwnerRepo(orgName, owner, repoName)
 	if err != nil {
-		return CreateBranchResponse{}, err
+		return createBranchResp, err
 	}
-	RefData := cbreq.Ref
 	re := regexp.MustCompile(`refs/heads/([^/]+)$`)
-	matches := re.FindStringSubmatch(RefData)
+	matches := re.FindStringSubmatch(cbreq.Ref)
 	var branch string
 	if len(matches) >= 2 {
 		branch = matches[1]
-		fmt.Println(branch)
+		//	fmt.Println(branch)
 	} else {
-		fmt.Println("Invalid branch name found in refs")
-		return CreateBranchResponse{}, errors.New("invalid branch name. Specify as refs/head/<branch>")
+		//	fmt.Println("Invalid branch name found in refs")
+		return CreateBranchResponse{}, ErrInvalidBranchName
 	}
-	branchList, _ := g.ListBranches(owner, repoName)
-	for _, branchData := range branchList {
-		if branchData.Name == branch {
-			return CreateBranchResponse{}, ErrBranchesAlreadyExists
-		}
-	}
-
-	branchInput := CreateBranchResponse{Ref: "refs/heads/" + branch,
-		NodeID: generateCustomID("NodeID"), URL: "https://api.github.com/repos/" + owner + "/" + repoName + "/git/" + cbreq.Ref,
-		Object: CreateBranchObjectResponse{Type: "Commit", SHA: cbreq.SHA,
-			URL: "https://api.github.com/repos/" + owner + "/" + repoName + "/git/commits/" + cbreq.SHA},
+	g.GbStoreInstance.MU.RLock()
+	branchList := g.GbStoreInstance.Repos[orgName+"/"+owner+"/"+repoName].Branches
+	branchID := len(g.GbStoreInstance.Repos[orgName+"/"+owner+"/"+repoName].Branches) + 1
+	g.GbStoreInstance.MU.RUnlock()
+	if slices.Contains(branchList, branch) {
+		return createBranchResp, ErrBranchesAlreadyExists
 	}
 
-	listbranchInput := ListBranchresponse{Name: branch, Commit: CommitDetails{SHA: cbreq.SHA, URL: "https://api.github.com/repos/" + owner + "/" + repoName + "/commits/" + cbreq.SHA}, Protected: true}
-	g.muRW.Lock()
-	defer g.muRW.Unlock()
-	gbServerBranchData = append(gbServerBranchData, branchInput)
-	gbSeverBranchListData = append(gbSeverBranchListData, listbranchInput)
+	nodeID := generateCustomID("NODEID")
+	url := "https://api.gbserver.com/repos/" + owner + "/" + repoName + "/git/commits/" + cbreq.SHA
+	commit := models.CommitDetails{SHA: cbreq.SHA, URL: url}
+	fullBranchName := orgName + "/" + owner + "/" + repoName + "/" + branch
 
-	return branchInput, nil
+	g.GbStoreInstance.MU.Lock()
+	g.GbStoreInstance.Repos[orgName+"/"+owner+"/"+repoName].Branches = append(g.GbStoreInstance.Repos[orgName+"/"+owner+"/"+repoName].Branches, branch)
 
+	g.GbStoreInstance.Branches[fullBranchName] = &models.Branch{
+		ID:         branchID,
+		RepoName:   repoName,
+		Name:       branch,
+		NodeID:     nodeID,
+		URL:        url,
+		Protected:  true,
+		CommitInfo: commit,
+	}
+	g.GbStoreInstance.MU.Unlock()
+	createBranchResp = CreateBranchResponse{Ref: cbreq.Ref, NodeID: nodeID, URL: url,
+		Object: CreateBranchObjectResponse{Type: "commit", SHA: cbreq.SHA, URL: url}}
+	return createBranchResp, nil
 }
 
-func (g *Gbserver) DeleteBranch(owner, repoName, ref string) (bool, error) {
-	branch := ref
-	err := g.validateOwnerAndRepo(owner, repoName)
+func (g *GbService) DeleteBranch(orgName, owner, repoName, branch string) (bool, error) {
+
+	err := g.validateOrgOwnerRepo(orgName, owner, repoName)
+	fullBranchName := orgName + "/" + owner + "/" + repoName + "/" + branch
 	if err != nil {
 		return false, err
 	}
-	branchList, _ := g.ListBranches(owner, repoName)
-	var repoFound bool
-	for _, branchData := range branchList {
-		if branchData.Name == branch {
-			repoFound = true
-		}
+	g.GbStoreInstance.MU.RLock()
+	if _, branchExists := g.GbStoreInstance.Branches[fullBranchName]; !branchExists {
+		g.GbStoreInstance.MU.RUnlock()
+		return false, ErrBranchesNotFound
 	}
-	if !repoFound {
-		fmt.Println("branch not found")
-		return false, errors.New("branch not found")
+	g.GbStoreInstance.MU.RUnlock()
+	g.GbStoreInstance.MU.Lock()
+	if g.GbStoreInstance.Branches[fullBranchName].PullRequestID != "" {
+
+		delete(g.GbStoreInstance.PullRequests, g.GbStoreInstance.Branches[fullBranchName].PullRequestID)
+		g.GbStoreInstance.Repos[orgName+"/"+owner+"/"+repoName].PrIDs = removeElementByValue(g.GbStoreInstance.Repos[orgName+"/"+owner+"/"+repoName].PrIDs, g.GbStoreInstance.Branches[fullBranchName].PullRequestID)
 	}
-	var done, done1 bool
-	var branchIndex, branchListIndex int
-	temp := make([]CreateBranchResponse, len(gbServerBranchData))
-	copy(temp, gbServerBranchData)
-	for index, data := range temp {
-		if data.Ref == "refs/heads/"+branch && strings.Contains(data.URL, "repos/"+owner+"/"+repoName+"/git/refs/heads/"+branch) {
-			branchIndex = index
-			done = true
-		}
-	}
-	if done {
-		copyData1 := make([]ListBranchresponse, len(gbSeverBranchListData))
-		copy(copyData1, gbSeverBranchListData)
-		for index, data := range copyData1 {
-			if data.Name == branch {
-				branchListIndex = index
-				done1 = true
-			}
-		}
-	}
-	if done && done1 {
-		gbServerBranchData = slices.Delete(gbServerBranchData, branchIndex, branchIndex+1)
-		gbSeverBranchListData = slices.Delete(gbSeverBranchListData, branchListIndex, branchListIndex+1)
-		return true, nil
-	}
-	return false, ErrBranchesNotFound
+	delete(g.GbStoreInstance.Branches, fullBranchName)
+
+	g.GbStoreInstance.Repos[orgName+"/"+owner+"/"+repoName].Branches = removeElementByValue(g.GbStoreInstance.Repos[orgName+"/"+owner+"/"+repoName].Branches, branch)
+	g.GbStoreInstance.MU.Unlock()
+	//fmt.Println("After delete branch", g.GbStoreInstance.Repos[orgName+"/"+owner+"/"+repoName])
+	return true, nil
 }
 
-func (g *Gbserver) ListPRs(owner, repoName string) ([]PRResponse, error) {
-	err := g.validateOwnerAndRepo(owner, repoName)
-	if err != nil {
-		return []PRResponse{}, err
+func (g *GbService) validateOrgOwnerRepo(orgName, owner, repoName string) error {
+	g.GbStoreInstance.MU.RLock()
+	defer g.GbStoreInstance.MU.RUnlock()
+	if _, exists := g.GbStoreInstance.Orgs[orgName]; !exists {
+		return ErrOrgNotFound
 	}
+	if _, exists := g.GbStoreInstance.Users[orgName+"/"+owner]; !exists {
+		return ErrOwnerNotFound
+	}
+	if _, exists := g.GbStoreInstance.Repos[orgName+"/"+owner+"/"+repoName]; !exists {
+		return ErrRepoNotFound
+	}
+
+	return nil
+}
+
+func (g *GbService) ListPRs(orgName, owner, repoName string) ([]PRResponse, error) {
+
 	var listPRresponse []PRResponse
-	//	fmt.Println("Total Prs..", gbServerListPR)
-	for _, data := range gbServerListPR {
-		if data.User.Login == owner {
-			re := regexp.MustCompile(`repos/([^/]+)/([^/]+)/pulls`)
-			matches := re.FindStringSubmatch(data.URL)
-			if len(matches) >= 3 {
-				User := matches[1]
-				Repo := matches[2]
-				_, err := getIDFromOwner(owner)
-				if err != nil {
-					return listPRresponse, ErrOwnerNotFound
-				}
 
-				repoList := g.ListRepos(orgName)
-				var repoFound bool
-				for _, repo := range repoList {
-					if repo.Name == repoName {
-						repoFound = true
-					}
-				}
-				if !repoFound {
-					return listPRresponse, ErrRepoNotFound
-				}
+	err := g.validateOrgOwnerRepo(orgName, owner, repoName)
+	if err != nil {
+		return listPRresponse, err
+	}
+	g.GbStoreInstance.MU.RLock()
+	//branchList := g.GbStoreInstance.Repos[orgName+"/"+owner+"/"+repoName].Branches
+	prsList := g.GbStoreInstance.Repos[orgName+"/"+owner+"/"+repoName].PrIDs
+	g.GbStoreInstance.MU.RUnlock()
+	for _, prID := range prsList {
+		//	prID := g.GbStoreInstance.Branches[branchName].PullRequestID
 
-				if User == owner && Repo == repoName { // && data.State == "open" {
-					listPRresponse = append(listPRresponse, data)
-				}
-			}
+		//	fmt.Println("PRS...", g.GbStoreInstance.PullRequests[prID])
+		g.GbStoreInstance.MU.RLock()
+		prDetails := g.GbStoreInstance.PullRequests[prID]
+		g.GbStoreInstance.MU.RUnlock()
+
+		featureBranch := strings.Split(prDetails.FromBranch, ":")
+		//featureBranchUser := featureBranch[0]
+		featureBranchName := featureBranch[1]
+		fullfeatureBranchName := orgName + "/" + owner + "/" + repoName + "/" + featureBranchName
+		fullbaseBranchName := orgName + "/" + owner + "/" + repoName + "/" + prDetails.ToBranch
+
+		g.GbStoreInstance.MU.RLock()
+		prOwner := OwnerInfo{Login: g.GbStoreInstance.Users[orgName+"/"+owner].LoginName,
+			NodeID: g.GbStoreInstance.Users[orgName+"/"+owner].NodeID, ID: g.GbStoreInstance.Users[orgName+"/"+owner].ID,
+			UserType: g.GbStoreInstance.Users[orgName+"/"+owner].UserType}
+
+		prHeadResp := baseHeadPRResponse{
+			Ref: g.GbStoreInstance.Branches[fullfeatureBranchName].Name, SHA: g.GbStoreInstance.Branches[fullfeatureBranchName].CommitInfo.SHA,
+			User: prOwner, Repo: repoName}
+		prBaseResp := baseHeadPRResponse{
+			Ref: g.GbStoreInstance.Branches[fullbaseBranchName].Name, SHA: g.GbStoreInstance.Branches[fullbaseBranchName].CommitInfo.SHA,
+			User: prOwner, Repo: repoName}
+		g.GbStoreInstance.MU.RUnlock()
+
+		prResp := PRResponse{
+			URL: prDetails.URL, ID: prDetails.ID, NodeID: prDetails.NodeID,
+			Title: prDetails.Title, Body: prDetails.Body, State: prDetails.State,
+			User: prOwner, Commits: prDetails.Commits, Additions: prDetails.Additions, Deletions: prDetails.Deletions,
+			ChangedFiles: prDetails.ChangedFiles,
+			Head:         prHeadResp,
+			Base:         prBaseResp,
 		}
+		listPRresponse = append(listPRresponse, prResp)
+
 	}
 	return listPRresponse, nil
 }
 
-// patch /Repos/{owner}/{Repo}/pulls/{pull_number} State - closed
-func (g *Gbserver) UpdatePR(owner, repoName string, pull_number int, prRequest *PRRequest) (PRResponse, error) {
+// // patch /Repos/{owner}/{Repo}/pulls/{pull_number} State - closed
+func (g *GbService) UpdatePR(orgName, owner, repoName, pull_number string, prRequest *PRRequest) (PRResponse, error) {
 	//'{"Title":"new Title","Body":"updated Body","State":"open","base":"master"}'
 	//closePRRequest := PRRequest{State: "closed"}
 	var closedPR PRResponse
-	err := g.validateOwnerAndRepo(owner, repoName)
+
+	err := g.validateOrgOwnerRepo(orgName, owner, repoName)
 	if err != nil {
 		return closedPR, err
 	}
-	for index, data := range gbServerListPR {
-		re := regexp.MustCompile(`repos/([^/]+)/([^/]+)/pulls/([^/]+)`)
-		matches := re.FindStringSubmatch(data.URL)
-		if len(matches) >= 3 {
-			User := matches[1]
-			Repo := matches[2]
-			pullNumber, err := strconv.Atoi(matches[3])
-			if err != nil {
-				fmt.Println("Error occured while converting the pull number")
-			}
-			if pullNumber == pull_number {
-				if User == owner && Repo == repoName && data.State == "open" {
-					g.muRW.Lock()
-					defer g.muRW.Unlock()
-					gbServerListPR[index].State = prRequest.State
-					closedPR = data
-					//fmt.Println("Updated data..", data)
-					return closedPR, nil
-				}
-			}
-		}
+	//pullNumberStr := strconv.Itoa(pull_number)
+	//fullPRID := orgName + "/" + owner + "/" + repoName + pullNumberStr
+	g.GbStoreInstance.MU.RLock()
+	if !slices.Contains(g.GbStoreInstance.Repos[orgName+"/"+owner+"/"+repoName].PrIDs, pull_number) {
+		g.GbStoreInstance.MU.RUnlock()
+		return closedPR, ErrPRNotFound
+	}
+	prDetails := g.GbStoreInstance.PullRequests[pull_number]
+	if g.GbStoreInstance.PullRequests[pull_number].State == "closed" {
+		g.GbStoreInstance.MU.RUnlock()
+		return closedPR, ErrPRAlreadyClosed
+	}
+	g.GbStoreInstance.MU.RUnlock()
+	branchInfo := prDetails.FromBranch
+	branchName := strings.Split(branchInfo, ":")[1]
+	fullBranchName := orgName + "/" + owner + "/" + repoName + "/" + branchName
+	g.GbStoreInstance.MU.Lock()
+	g.GbStoreInstance.Branches[fullBranchName].PullRequestID = ""
+	//	g.GbStoreInstance.PullRequests[pull_number].Title = prRequest.Title
+	//	g.GbStoreInstance.PullRequests[pull_number].Body = prRequest.Body
+	g.GbStoreInstance.PullRequests[pull_number].State = prRequest.State
+	closedPRData := g.GbStoreInstance.PullRequests[pull_number]
+	g.GbStoreInstance.MU.Unlock()
+
+	featureBranch := strings.Split(closedPRData.FromBranch, ":")
+
+	featureBranchName := featureBranch[1]
+	fullFeatureBranchName := orgName + "/" + owner + "/" + repoName + "/" + featureBranchName
+	fullBaseBranchName := orgName + "/" + owner + "/" + repoName + "/" + closedPRData.ToBranch
+
+	g.GbStoreInstance.MU.RLock()
+	ownerDetails := OwnerInfo{
+		Login:    g.GbStoreInstance.Users[orgName+"/"+owner].LoginName,
+		ID:       g.GbStoreInstance.Users[orgName+"/"+owner].ID,
+		UserType: g.GbStoreInstance.Users[orgName+"/"+owner].UserType,
+		NodeID:   g.GbStoreInstance.Users[orgName+"/"+owner].NodeID,
 	}
 
-	//	fmt.Println("*****No PRs found.", pull_number)
-	return closedPR, ErrPRNotFound
+	prHeadResp := baseHeadPRResponse{
+
+		Ref:  closedPRData.FromBranch,
+		SHA:  g.GbStoreInstance.Branches[fullFeatureBranchName].CommitInfo.SHA,
+		User: ownerDetails,
+		Repo: repoName,
+	}
+
+	prBaseResp := baseHeadPRResponse{
+
+		Ref:  closedPRData.ToBranch,
+		SHA:  g.GbStoreInstance.Branches[fullBaseBranchName].CommitInfo.SHA,
+		User: ownerDetails,
+		Repo: repoName,
+	}
+	g.GbStoreInstance.MU.RUnlock()
+
+	closedPR = PRResponse{
+		URL:          closedPRData.URL,
+		ID:           closedPRData.ID,
+		NodeID:       closedPRData.NodeID,
+		Title:        closedPRData.Title,
+		Body:         closedPRData.Body,
+		State:        closedPRData.State,
+		User:         ownerDetails,
+		Commits:      closedPRData.Commits,
+		Additions:    closedPRData.Additions,
+		Deletions:    closedPRData.Deletions,
+		ChangedFiles: closedPRData.ChangedFiles,
+		Head:         prHeadResp,
+		Base:         prBaseResp,
+	}
+
+	return closedPR, nil
 }
 
-func getOwnerInfoByOwner(Name string) OwnerInfo {
-	for _, data := range gbServerOwners {
-		if data.Login == Name {
-			return data
-		}
-	}
-	return OwnerInfo{}
-}
-
-func getRepoDetailsByRepoOwner(owner string, Name string) RepoResponse {
-	for _, data := range gbServerRepoData {
-		if data.OwnerInfo.Login == owner && data.Name == Name {
-			return data
-		}
-	}
-	return RepoResponse{}
-}
-
-func getSHAFromBranchDataByBranch(branch string) string {
-	for _, data := range gbSeverBranchListData {
-		if data.Name == branch {
-			return data.Commit.SHA
-		}
-	}
-	return ""
-
-}
-
-func (g *Gbserver) validateRepoOwnerOrgAccess(owner, headOwnerName string) error {
-	var orgMembers []string
-	for _, members := range gbServerOrg {
-		for _, owners := range members {
-			orgMembers = append(orgMembers, owners.Login)
-		}
-		if slices.Contains(orgMembers, owner) && slices.Contains(orgMembers, headOwnerName) {
-			return nil
-		}
-	}
-	return ErrOwnerNotInSameOrg
-}
-
-func (g *Gbserver) validateBranches(owner, repoName, branch string) error {
-	branchList, err := g.ListBranches(owner, repoName)
-	if err != nil {
-		fmt.Println("Error occurred while validating branch access", err)
-		return err
-	}
-	for _, branchData := range branchList {
-		if branchData.Name == branch {
-			return nil
-		}
-	}
-	fmt.Println("branch not found")
-	return ErrBranchesNotFound
-}
-
-// post /Repos/{owner}/{Repo}/pulls
-func (g *Gbserver) CreatePR(owner, repoName string, cPRReq *PRRequest) (PRResponse, error) {
+// // post /Repos/{owner}/{Repo}/pulls
+func (g *GbService) CreatePR(orgName, owner, repoName string, cPRReq *PRRequest) (PRResponse, error) {
 	//'{"Title":"Amazing new feature",
 	//"Body":"Please pull these awesome changes in!","head":"octocat:new-feature","base":"master"}'
-	UserDetails := getOwnerInfoByOwner(owner)
-	RepoDetails := getRepoDetailsByRepoOwner(owner, repoName)
+	var createPRresponse PRResponse
 
-	// To build and store into list PR
-	RefHeadBranchData := strings.Split(cPRReq.Head, ":")
+	err := g.validateOrgOwnerRepo(orgName, owner, repoName)
+	if err != nil {
+		return createPRresponse, err
+	}
 
-	headOwner := RefHeadBranchData[0]
-	err := g.validateRepoOwnerOrgAccess(owner, headOwner)
-	if err != nil {
-		return PRResponse{}, err
-	}
-	err = g.validateBranches(owner, repoName, RefHeadBranchData[1])
-	if err != nil {
-		return PRResponse{}, err
-	}
-	err = g.validateBranches(owner, repoName, cPRReq.Base)
-	if err != nil {
-		return PRResponse{}, err
-	}
-	SHAHeadData := getSHAFromBranchDataByBranch(RefHeadBranchData[1])
-	SHABaseData := getSHAFromBranchDataByBranch(cPRReq.Base)
+	featureBranch := strings.Split(cPRReq.Head, ":")
+	//featureBranchUser := featureBranch[0]
+	featureBranchName := featureBranch[1]
+	fullFeatureBranchName := orgName + "/" + owner + "/" + repoName + "/" + featureBranchName
+	fullBaseBranchName := orgName + "/" + owner + "/" + repoName + "/" + cPRReq.Base
 
-	prList, err := g.ListPRs(owner, repoName)
-	if err != nil {
-		//	fmt.Println("Error occurred.", err)
-		return PRResponse{}, err
+	g.GbStoreInstance.MU.RLock()
+	if _, branchExists := g.GbStoreInstance.Branches[fullFeatureBranchName]; !branchExists {
+		g.GbStoreInstance.MU.RUnlock()
+		return createPRresponse, ErrBranchesNotFound
 	}
-	for _, pr := range prList {
-		if pr.Head.Label == cPRReq.Head && pr.State == "open" {
-			//	fmt.Println("PR already exists.Error occurred.", err)
-			return PRResponse{}, ErrPRAlreadyExists
-		}
+	if _, branchExists := g.GbStoreInstance.Branches[fullBaseBranchName]; !branchExists {
+		g.GbStoreInstance.MU.RUnlock()
+		return createPRresponse, ErrBranchesNotFound
 	}
-	prData := PRResponse{ID: len(gbServerListPR) + 1, NodeID: generateCustomID("NodeID"), URL: "https://api.github.com/repos/" + owner + "/" + repoName + "/pulls/" + strconv.Itoa(len(gbServerListPR)+1),
-		Title: cPRReq.Title, Body: cPRReq.Body, State: "open", User: UserDetails, Commits: 10, Additions: 23, Deletions: 5, ChangedFiles: 8,
-		Head: baseHeadPRResponse{Label: cPRReq.Head, Ref: RefHeadBranchData[1], SHA: SHAHeadData, User: UserDetails, Repo: RepoDetails},
-		Base: baseHeadPRResponse{Label: cPRReq.Base, Ref: cPRReq.Base, SHA: SHABaseData, User: UserDetails, Repo: RepoDetails},
+
+	if g.GbStoreInstance.Branches[fullFeatureBranchName].PullRequestID != "" {
+		g.GbStoreInstance.MU.RUnlock()
+		return createPRresponse, ErrPRAlreadyExists
 	}
-	//	fmt.Println("before cr creation", gbServerListPR)
-	g.muRW.Lock()
-	gbServerListPR = append(gbServerListPR, prData)
-	//	fmt.Println("After cr creation", gbServerListPR)
-	g.muRW.Unlock()
-	return prData, nil
+
+	prCount := g.GbStoreInstance.Repos[orgName+"/"+owner+"/"+repoName].TotalPRs + 1
+	g.GbStoreInstance.MU.RUnlock()
+
+	fullPRName := orgName + "/" + owner + "/" + repoName + "/" + strconv.Itoa(prCount)
+	prID := hasher(fullPRName)
+
+	g.GbStoreInstance.MU.Lock()
+	g.GbStoreInstance.Repos[orgName+"/"+owner+"/"+repoName].TotalPRs = prCount
+
+	g.GbStoreInstance.Branches[fullFeatureBranchName].PullRequestID = prID
+
+	g.GbStoreInstance.Repos[orgName+"/"+owner+"/"+repoName].PrIDs = append(g.GbStoreInstance.Repos[orgName+"/"+owner+"/"+repoName].PrIDs, prID)
+
+	g.GbStoreInstance.MU.Unlock()
+	nodeId := generateCustomID("NODEID")
+	//prIDAsString := strconv.Itoa(prID)
+
+	commits := rand.Intn(50)
+	additions := rand.Intn(50)
+	deletions := rand.Intn(50)
+	changedFiles := rand.Intn(50)
+
+	url := "https://api.gbserver.com/repos/" + owner + "/" + repoName + "/" + prID
+
+	g.GbStoreInstance.MU.RLock()
+	g.GbStoreInstance.PullRequests[prID] = &models.PullRequest{
+		NodeID:       nodeId,
+		URL:          url,
+		ID:           prID,
+		RepoName:     repoName,
+		FromBranch:   cPRReq.Head,
+		ToBranch:     cPRReq.Base,
+		AuthorID:     g.GbStoreInstance.Users[orgName+"/"+owner].ID,
+		State:        "open",
+		Title:        cPRReq.Title,
+		Body:         cPRReq.Body,
+		Commits:      commits,
+		Additions:    additions,
+		Deletions:    deletions,
+		ChangedFiles: changedFiles,
+	}
+
+	ownerDetails := OwnerInfo{
+		Login:    g.GbStoreInstance.Users[orgName+"/"+owner].LoginName,
+		ID:       g.GbStoreInstance.Users[orgName+"/"+owner].ID,
+		UserType: g.GbStoreInstance.Users[orgName+"/"+owner].UserType,
+		NodeID:   g.GbStoreInstance.Users[orgName+"/"+owner].NodeID,
+	}
+
+	prHeadResp := baseHeadPRResponse{
+
+		Ref:  cPRReq.Base,
+		SHA:  g.GbStoreInstance.Branches[fullBaseBranchName].CommitInfo.SHA,
+		User: ownerDetails,
+		Repo: repoName,
+	}
+
+	prBaseResp := baseHeadPRResponse{
+
+		Ref:  featureBranchName,
+		SHA:  g.GbStoreInstance.Branches[fullFeatureBranchName].CommitInfo.SHA,
+		User: ownerDetails,
+		Repo: repoName,
+	}
+	g.GbStoreInstance.MU.RUnlock()
+	//fmt.Println(g.GbStoreInstance.PullRequests)
+	createPRresponse = PRResponse{
+		URL:          url,
+		ID:           prID,
+		NodeID:       nodeId,
+		Title:        cPRReq.Title,
+		Body:         cPRReq.Body,
+		State:        "open",
+		User:         ownerDetails,
+		Commits:      commits,
+		Additions:    additions,
+		Deletions:    deletions,
+		ChangedFiles: changedFiles,
+		Head:         prHeadResp,
+		Base:         prBaseResp,
+	}
+
+	return createPRresponse, nil
+
 }
